@@ -39,7 +39,7 @@ Purpose:
 
     4. for all suspicious threads which were stuck in futex syscalls with '0x2'
        as third param we have to unwind the stack using 'libunwind' library.
-       If top frame is a '__lll_lock_wait' - that's it, we probably it.
+       If top frame is a '__lll_lock_wait' - that's it, we probably found it.
 
     5. first param of the futex syscall is an address of lock value, so:
              202 0x601650 0x80 0x2 0x601650 ....
