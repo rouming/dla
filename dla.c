@@ -77,11 +77,28 @@ struct hash_table {
 	unsigned int      h_sz;
 };
 
+struct backtrace_frame {
+	unw_word_t ip;
+	unw_word_t ip_off;
+	unw_word_t sp;
+	char       f_name[32];
+};
+
+struct backtrace {
+	struct backtrace_frame frames[64];
+	unsigned int           cap;
+	unsigned int           cnt;
+};
+
+struct loopback {
+	struct list_head loop_l;
+	struct list_head spur_l;
+};
+
 struct task {
 	struct hash_entry h_entry;
 	struct list_head  l_entry;
 	struct list_head  l_stuck;
-
 
 	pid_t tgid;
 	pid_t tid;
@@ -89,17 +106,37 @@ struct task {
 	unsigned long      diff_vol_ctxt_sw;
 	unsigned long      diff_nonvol_ctxt_sw;
 
+	unsigned long long start_ms;
+	unsigned long long check_ms;
 	unsigned long long vol_ctxt_sw;
 	unsigned long long nonvol_ctxt_sw;
-	unsigned long long check_ms;
 
 	struct {
-		int           nr;
-		unsigned long arg1;
-		unsigned long arg2;
-		unsigned long arg3;
+		int            nr;
+		unsigned long  arg1;
+		unsigned long  arg2;
+		unsigned long  arg3;
 	} syscall;
+
+	struct {
+		pid_t            lock_owner_pid;
+		struct task     *lock_owner_task;
+		struct loopback *loop;
+	} pthread_info;
+
+	struct backtrace   bt;
 };
+
+static void loopback_init(struct loopback *l)
+{
+	INIT_LIST_HEAD(&l->loop_l);
+	INIT_LIST_HEAD(&l->spur_l);
+}
+
+static int is_chain_loopback(struct task *t)
+{
+	return !!(t->pthread_info.lock_owner_task);
+}
 
 static inline unsigned long long msecs_epoch()
 {
@@ -117,7 +154,8 @@ static void __task_free(struct hash_entry *e)
 	free(t);
 }
 
-static struct task *task_new(pid_t tgid, pid_t tid)
+static struct task *task_new(pid_t tgid, pid_t tid,
+							 unsigned long long start_ms)
 {
 	struct task *t;
 
@@ -127,9 +165,11 @@ static struct task *task_new(pid_t tgid, pid_t tid)
 
 	t->tgid             = tgid;
 	t->tid              = tid;
+	t->start_ms         = start_ms;
 	t->h_entry.h_key    = &t->tid;
 	t->h_entry.h_key_sz = sizeof(t->tid);
 	t->h_entry.h_free   = __task_free;
+	t->bt.cap           = ARRAY_SIZE(t->bt.frames);
 
 	INIT_LIST_HEAD(&t->l_entry);
 	INIT_LIST_HEAD(&t->l_stuck);
@@ -208,6 +248,16 @@ out:
 	return res;
 }
 
+static void task_init_syscall(struct task *t)
+{
+	memset(&t->syscall, 0, sizeof(t->syscall));
+}
+
+static void task_init_pthread_info(struct task *t)
+{
+	memset(&t->pthread_info, 0, sizeof(t->pthread_info));
+}
+
 static int is_task_stuck(const struct task *task)
 {
 	return !task->diff_nonvol_ctxt_sw && !task->diff_vol_ctxt_sw;
@@ -215,8 +265,6 @@ static int is_task_stuck(const struct task *task)
 
 static int is_task_stuck_in_futex(struct task *task)
 {
-	if (!task_fill_syscall(task))
-		return 0;
 	if (task->syscall.nr != SYS_futex)
 		return 0;
 	/* Here we handle only 'pthread_mutex_lock', which has '2' as lock value, */
@@ -288,6 +336,12 @@ static struct hash_entry *hash_lookup(struct hash_table *h,
 	return NULL;
 }
 
+#define hash_lookup_entry(h_tbl, key, key_sz, type, member)		  \
+	({								  \
+		struct hash_entry *h_e = hash_lookup(h_tbl, key, key_sz); \
+		(h_e ? container_of(h_e, type, member) : NULL);		  \
+	})
+
 static int is_dot_dot_file(const char *p)
 {
 	return !strcmp(p, ".") || !strcmp(p, "..");
@@ -296,6 +350,50 @@ static int is_dot_dot_file(const char *p)
 static int is_tgid_tid(const char *p, pid_t *tgid, pid_t *tid)
 {
 	return (2 == sscanf(p, "/proc/%u/task/%u", tgid, tid));
+}
+
+static int task_get_start_ms(pid_t tid, unsigned long long *start_ms)
+{
+	int fd;
+	char buff[1024];
+	size_t rd;
+	int start_time_rev_field = 31;
+	const char *str = buff;
+	unsigned int clk_tck = sysconf(_SC_CLK_TCK);
+
+	if (!clk_tck)
+		return 0;
+
+	snprintf(buff, sizeof(buff), "/proc/%u/stat", tid);
+
+	fd = open(buff, O_RDONLY);
+	if (fd < 0)
+		return 0;
+
+	rd = read(fd, buff, sizeof(buff) - 1);
+	close(fd);
+	if (rd < 2)
+		return 0;
+
+	buff[rd] = '\0';
+
+	/* We do reverse search to avoid complicated parsing of the second
+	   field, which is process name, which obviously can contains spaces */
+	for (; rd; rd--) {
+		if (str[rd] == ' ')
+			if (!--start_time_rev_field)
+				break;
+	}
+
+	if (!rd)
+		return 0;
+
+	if (1 != sscanf(str + rd, "%llu", start_ms))
+		return 0;
+
+	*start_ms = *start_ms * (1000 / clk_tck);
+
+	return 1;
 }
 
 struct {
@@ -307,9 +405,9 @@ struct {
 static int nftw_proc_scan(const char *fpath, const struct stat *sb,
 			  int tflag, struct FTW *ftwbuf)
 {
-	struct hash_entry *h_entry;
 	struct task *task;
 	pid_t tgid, tid;
+	unsigned long long task_start_ms;
 
 	(void)sb;
 
@@ -321,18 +419,33 @@ static int nftw_proc_scan(const char *fpath, const struct stat *sb,
 		return 0;
 	if (!is_tgid_tid(fpath, &tgid, &tid))
 		return 0;
+	if (!task_get_start_ms(tid, &task_start_ms))
+		return 0;
 
-	h_entry = hash_lookup(__nftw_ctx.tasks, &tid, sizeof(tid));
-	if (!h_entry) {
-		task = task_new(tgid, tid);
+	task = hash_lookup_entry(__nftw_ctx.tasks, &tid, sizeof(tid),
+				 struct task, h_entry);
+	if (!task) {
+		task = task_new(tgid, tid, task_start_ms);
 		if (!task) {
 			printf("memory problems\n");
 			return -1;
 		}
 		hash_insert(__nftw_ctx.tasks, &task->h_entry);
 	} else {
-		task = container_of(h_entry, struct task, h_entry);
+		/* If pid was reused - drop the task, will pick it up on next scan */
+		if (task->start_ms != task_start_ms) {
+			hash_remove(&task->h_entry);
+			return 0;
+		}
 		list_del(&task->l_entry);
+
+		/* Update tgid, it can be changed since last scan */
+		task->tgid = tgid;
+		/* XXX CORRECT MEMSETTING SHOULD BE GUARANTEED BY THE ALGO ITSELF ON
+		*      EVERY SCAN */
+		/* task_init_pthread_info(task); */
+		assert(list_empty(&task->l_stuck));
+		task_init_syscall(task);
 	}
 
 	list_add_tail(&task->l_entry, __nftw_ctx.list);
@@ -340,8 +453,9 @@ static int nftw_proc_scan(const char *fpath, const struct stat *sb,
 	task->check_ms = msecs_epoch();
 	task_fill_ctxt_sw(task);
 
-	if (is_task_stuck(task) && is_task_stuck_in_futex(task))
-		list_add(&task->l_stuck, __nftw_ctx.stuck_list);
+	if (is_task_stuck(task) && task_fill_syscall(task))
+		if (is_task_stuck_in_futex(task))
+			list_add(&task->l_stuck, __nftw_ctx.stuck_list);
 
 	return 0;
 }
@@ -362,15 +476,9 @@ static int do_tasks_scan(struct hash_table *hash_tasks, struct list_head *list,
 	return 0;
 }
 
-struct backtrace_frame {
-	unw_word_t ip;
-	unw_word_t ip_off;
-	unw_word_t sp;
-	char       f_name[32];
-};
-
-static int do_backtrace(struct backtrace_frame *bt, unsigned int max_bt_sz,
-			 unw_addr_space_t as, struct UPT_info *ui)
+static int do_backtrace(struct backtrace_frame *bt, unsigned int *bt_sz,
+			unsigned int max_bt_sz, unw_addr_space_t as,
+			struct UPT_info *ui)
 {
 	unw_word_t start_ip = 0;
 	int n = 0, ret;
@@ -415,8 +523,10 @@ static int do_backtrace(struct backtrace_frame *bt, unsigned int max_bt_sz,
 
 	if (ret < 0)
 		return ret;
-	else
-		return n;
+
+	*bt_sz = n;
+
+	return 0;
 }
 
 static int is_lll_lock_wait(struct backtrace_frame *f)
@@ -424,32 +534,76 @@ static int is_lll_lock_wait(struct backtrace_frame *f)
 	return (0 == strcmp(f->f_name, "__lll_lock_wait"));
 }
 
-static void print_backtrace(struct task *t,
-			    struct backtrace_frame *bt, unsigned int bt_sz)
+static int peek_pthread_info(struct task *t)
+{
+	pid_t tid;
+	pthread_mutex_t *tracee_mutex;
+
+	/* Black magic? No, just wrap 'int' type in complicated manner */
+	typeof(tracee_mutex->__data.__lock) *tracee_lock =
+		(typeof(tracee_mutex->__data.__lock) *)t->syscall.arg1;
+	/* Cast tracee lock to whole pthread mutex object */
+	tracee_mutex = container_of(tracee_lock, pthread_mutex_t, __data.__lock);
+	/* Peek pthread onwer */
+	tid = ptrace(PTRACE_PEEKDATA, t->tid, &tracee_mutex->__data.__owner, NULL);
+	if (errno != 0) {
+		perror("ptrace(PTRACE_PEEKDATA)");
+		return -1;
+	}
+
+	t->pthread_info.lock_owner_pid = tid;
+
+	return 0;
+}
+
+static void print_backtrace(struct task *t)
 {
 	unsigned int i;
 
-	printf("Task: tgid %u, tid %u:\n", t->tgid, t->tid);
+	printf("  tid %u (tgid %u) waits for tid %u:\n",
+	       t->tid, t->tgid, t->pthread_info.lock_owner_pid);
 
-	for (i = 0; i < bt_sz; i++)
+	for (i = 0; i < t->bt.cnt; i++)
 		printf("\t%016lx %s + 0x%lx\n",
-		       (long)bt[i].ip, bt[i].f_name, (long)bt[i].ip_off);
-
-	printf("\n");
+		       (long)t->bt.frames[i].ip, t->bt.frames[i].f_name,
+		       (long)t->bt.frames[i].ip_off);
 }
 
-static void do_futex_stuck_analysis(struct task *t)
+static void print_loopback(struct loopback *l, unsigned int ind)
+{
+	struct task *t;
+
+	printf("----------------------------------------------\n");
+	printf("%u) lock loopback:\n", ind);
+
+	list_for_each_entry(t, &l->loop_l, l_stuck) {
+		print_backtrace(t);
+		printf("\n");
+	}
+
+	if (!list_empty(&l->spur_l)) {
+		printf("tasks which wait for loopback:\n");
+
+		list_for_each_entry(t, &l->spur_l, l_stuck) {
+			print_backtrace(t);
+			printf("\n");
+		}
+
+		printf("\n");
+	}
+}
+
+static int unwind_pthread_backtrace(struct task *t)
 {
 	unw_addr_space_t as;
 	struct UPT_info *ui;
 	int status, ret;
 	int waits = 20;
-	struct backtrace_frame bt[64] = {};
 
 	/* XXX: on sudden death we have to do detach, TODO catch signals */
 	if (ptrace(PTRACE_ATTACH, t->tid, NULL, NULL) < 0) {
 		perror("ptrace(PTRACE_ATTACH)");
-		return;
+		return -1;
 	}
 
 	/* Wait for ptrace stop */
@@ -473,24 +627,31 @@ static void do_futex_stuck_analysis(struct task *t)
 	as = unw_create_addr_space(&_UPT_accessors, 0);
 	if (!as) {
 		printf("unw_create_addr_space() failed");
+		ret = -1;
 		goto err_detach;
 	}
 
 	ui = _UPT_create(t->tid);
 	if (!ui) {
 		printf("_UPT_create() failed");
+		ret = -1;
 		goto err_free_addr_space;
 	}
 
-	ret = do_backtrace(bt, ARRAY_SIZE(bt), as, ui);
-	if (ret > 0 && is_lll_lock_wait(&bt[0]))
-		print_backtrace(t, bt, ret);
+	ret = do_backtrace(t->bt.frames, &t->bt.cnt, t->bt.cap, as, ui);
+	if (!ret) {
+		/* Here we are interested only in 'lll_lock_wait' */
+		if (is_lll_lock_wait(&t->bt.frames[0]))
+			ret = peek_pthread_info(t);
+	}
 
 	_UPT_destroy(ui);
 err_free_addr_space:
 	unw_destroy_addr_space(as);
 err_detach:
 	ptrace(PTRACE_DETACH, t->tid, NULL, NULL);
+
+	return ret;
 }
 
 static struct list_head *swap_scan_lists(struct list_head *lists,
@@ -508,10 +669,13 @@ static struct list_head *swap_scan_lists(struct list_head *lists,
 int main(int argc, char *argv[])
 {
 	int ret;
+	unsigned int i;
 	struct hash_table hash_tasks;
-	struct list_head scan_lists[2];
-	struct list_head stuck_list;
+	struct list_head  scan_lists[2];
+	struct list_head  stuck_list;
 	struct list_head *list = NULL;
+	struct loopback   loops[16];
+	struct task *t_l, *tmp_l;
 
 	(void)argc;
 	(void)argv;
@@ -519,27 +683,156 @@ int main(int argc, char *argv[])
 	INIT_LIST_HEAD(&scan_lists[0]);
 	INIT_LIST_HEAD(&scan_lists[1]);
 	INIT_LIST_HEAD(&stuck_list);
+
 	hash_init(&hash_tasks);
 
+	for (i = 0; i < ARRAY_SIZE(loops); i++)
+		loopback_init(&loops[i]);
+
 	while (1) {
-		struct task *t, *tmp;
+		struct task *t,  *tmp;
 		struct list_head *prev_list = list;
+		unsigned int      loop_nr = 0;
 
 		list = swap_scan_lists(scan_lists, ARRAY_SIZE(scan_lists), list);
+
+		/* Everything should be correctly cleaned up */
+		assert(list_empty(&stuck_list));
 
 		/* Scan all the tasks and fill the hash */
 		ret = do_tasks_scan(&hash_tasks, list, &stuck_list);
 		if (ret) {
-			printf("ERROR: do_tasks_scan failed, %d\n", ret);
-			exit(1);
+			printf("ERROR: do_tasks_scan failed, %d, repeat\n", ret);
+			goto free_dead;
 		}
 
 		/* We have some tasks stuck in futex, do further analysis */
-		list_for_each_entry_safe(t, tmp, &stuck_list, l_stuck) {
-			do_futex_stuck_analysis(t);
-			list_del(&t->l_stuck);
+		while (!list_empty(&stuck_list)) {
+			struct task *t_prev = NULL;
+			struct loopback *loop;
+
+			t = list_first_entry(&stuck_list, struct task, l_stuck);
+			assert(!is_chain_loopback(t));
+
+			if (loop_nr >= ARRAY_SIZE(loops)) {
+				printf("WARNING: maximum number %d of possible loopbacks exceeded\n",
+				       loop_nr);
+				break;
+			}
+
+			loop = &loops[loop_nr];
+			assert(list_empty(&loop->loop_l));
+			assert(list_empty(&loop->spur_l));
+
+			/* Cycle till chain is broken or loopback is found */
+			do {
+				pid_t tid;
+
+				/* Move task to loop */
+				list_del(&t->l_stuck);
+				list_add_tail(&t->l_stuck, &loop->loop_l);
+				t->pthread_info.loop = loop;
+
+				ret = unwind_pthread_backtrace(t);
+				if (ret)
+					break;
+
+				/* Every task in chain should be suspicious */
+				if (list_empty(&t->l_stuck))
+					break;
+
+				/* Now we are interested only in pthread_mutex_lock */
+				if (!is_lll_lock_wait(&t->bt.frames[0]))
+					break;
+
+				/* Chain it */
+				if (t_prev)
+					t_prev->pthread_info.lock_owner_task = t;
+				t_prev = t;
+
+				/* Do hash lookup of lock owner */
+				tid = t->pthread_info.lock_owner_pid;
+				assert(tid != 0);
+				t = hash_lookup_entry(&hash_tasks, &tid, sizeof(tid),
+						      struct task, h_entry);
+
+			} while (t && !is_chain_loopback(t));
+
+			/* Handle two cases: chain is broken or chain is a spur
+			 * of another loop:
+			 *    chain is broken:      !t || !is_chain_loopback
+			 *    spur of another loop: t->loop != loop
+			 *
+			 * If chain is broken just forget about the tasks in this chain.
+			 * If chain is a spur and belongs to another loop just splice this
+			 * chain to the spur list of another loop.
+			 */
+			if (!t || !is_chain_loopback(t) ||
+			    t->pthread_info.loop != loop) {
+				int chain_broken = (!t || !is_chain_loopback(t));
+
+				list_for_each_entry_safe(t_l, tmp_l, &loop->loop_l,
+							 l_stuck) {
+					list_del(&t_l->l_stuck);
+					if (chain_broken) {
+						INIT_LIST_HEAD(&t_l->l_stuck);
+						task_init_pthread_info(t_l);
+					} else {
+						struct loopback *l;
+
+						assert(t);
+						l = t->pthread_info.loop;
+
+						t_l->pthread_info.loop = l;
+						list_add_tail(&t_l->l_stuck, &l->spur_l);
+					}
+				}
+				continue;
+			}
+
+			/* Got it, loopback is found, sort out spur tasks */
+			list_for_each_entry_safe(t_l, tmp_l, &loop->loop_l,
+						 l_stuck) {
+				/* Reach the loop entrance, quit */
+				if (t_l == t)
+					break;
+
+				list_del(&t_l->l_stuck);
+				list_add_tail(&t_l->l_stuck, &loop->spur_l);
+			}
+
+			loop_nr++;
 		}
 
+
+		/* There are no excuses to have non empty list with loops
+		 * less than possible, everything should be sorted out on
+		 * previous steps
+		 */
+		assert(list_empty(&stuck_list) || loop_nr >= ARRAY_SIZE(loops));
+
+		/* Here we have loopbacks and its' spurs, deal with them */
+		for (i = 0; i < loop_nr; i++) {
+			struct loopback *loop = &loops[i];
+
+			print_loopback(loop, i+1);
+
+			/* Return everything back to stuck list for
+			 * further cleanups
+			 */
+			list_splice(&loop->loop_l, &stuck_list);
+			list_splice(&loop->spur_l, &stuck_list);
+			loopback_init(loop);
+		}
+
+		/* Remove remains */
+		list_for_each_entry_safe(t_l, tmp_l, &stuck_list,
+					 l_stuck) {
+			list_del_init(&t_l->l_stuck);
+			task_init_pthread_info(t_l);
+		}
+
+	free_dead:
 		/* Remove all tasks which now are dead since last scan */
 		if (prev_list) {
 			list_for_each_entry_safe(t, tmp, prev_list, l_entry)

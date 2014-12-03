@@ -1,0 +1,141 @@
+dla: deadlock analyser tool
+
+Purpose:
+  Analyses simple ABBA deadlocks (basically pthread_mutex_lock) from user
+  space, scanning /proc/*/task, reading /proc/*/syscall and /proc/*/status,
+  doing ptrace.  So definitely this tool is a hack which works only on Linux.
+
+  It is not a static analyser, this tool does post-mortem analysis, when
+  something on your system has stuck and you have to understand what exactly
+  and to see the locking dependency.
+
+  The idea behind this is very simple:
+
+    1. if context switch counters have not been updated since last visit
+       the thread has been stuck:
+	     # cat /proc/self/status | grep switches
+		 voluntary_ctxt_switches:	1
+		 nonvoluntary_ctxt_switches:	1
+
+	2. if thread is stuck in futex syscall it becomes suspicious:
+	     # sudo cat /proc/*/task/*/syscall | grep '^202'
+         202 0x7fffc8b336dc 0x89 0x1 0x7fffc8b33658 ...
+		                         ^^^
+							     pthread_cond_wait
+		 ....
+		 202 0x7fff60dd3c80 0x80 0x0 0x0 ...
+		                         ^^^
+							     sem_wait
+		 ....
+		 202 0x601650 0x80 0x2 0x0 0x601650 ...
+		                   ^^^
+						   pthread_mutex_lock
+
+	3. according to the glibc 'pthread_mutex_lock' can be found by '0x2' as
+	   third param:
+			 202 0x601650 0x80 0x2 0x601650 ....
+			                   ^^^
+	   all these calls are our candidates for further analysis.
+
+	4. for all suspicious threads which were stuck in futex syscalls with '0x2'
+	   as third param we have to unwind the stack using 'libunwind' library.
+	   If top frame is a '__lll_lock_wait' - that's it, we probably it.
+
+	5. first param of the futex syscall is an address of lock value, so:
+			 202 0x601650 0x80 0x2 0x601650 ....
+			     ^^^^^^^^
+		is a pthread_mutex_t object:
+
+		(gdb) p *(pthread_mutex_t *)0x601650
+		$2 = {
+		__data = {
+		__lock = 2,           <<<< our value
+		__count = 0,
+		__owner = 17716,
+		__nusers = 1,
+		__kind = 0,
+		.....
+
+		what is interesting here is '__owner' value, which points out the thread
+		whom we are waiting for.
+
+
+	6. pick '__owner' value using ptrace and build dependency graph, where
+	   deadlock loop can be found.
+
+	7. if loop is found dla tool outputs lock dependency, sleep and jumps to 1.
+
+Usage:
+  dla is just a proof of concept, so it detects deadlocks in cycle and always
+  outputs the result.  To test it you can simply run ./test-deadlock, the
+  application which creates 3 deadlock loops:
+
+  $ ./test-deadlock
+  loop 1 started
+  loop 2 started
+  loop 3 started
+
+  And in the second console
+
+  $ sudo ./dla
+
+  Yes, it requires root because dla scans all processes on the system.
+
+  The output is like this:
+
+----------------------------------------------
+1) lock loopback:
+  tid 21070 (tgid 21063) waits for tid 21070:
+	00007f65cdd1b10c __lll_lock_wait + 0x1c
+	00007f65cdd15885 pthread_mutex_lock + 0x75
+	00000000004009ca thread_start + 0x74
+	00007f65cdd13314 start_thread + 0xc4
+	00007f65cda513ed clone + 0x6d
+
+----------------------------------------------
+2) lock loopback:
+  tid 21065 (tgid 21063) waits for tid 21064:
+	00007f65cdd1b10c __lll_lock_wait + 0x1c
+	00007f65cdd15885 pthread_mutex_lock + 0x75
+	00000000004009ca thread_start + 0x74
+	00007f65cdd13314 start_thread + 0xc4
+	00007f65cda513ed clone + 0x6d
+
+  tid 21064 (tgid 21063) waits for tid 21065:
+	00007f65cdd1b10c __lll_lock_wait + 0x1c
+	00007f65cdd15885 pthread_mutex_lock + 0x75
+	00000000004009ca thread_start + 0x74
+	00007f65cdd13314 start_thread + 0xc4
+	00007f65cda513ed clone + 0x6d
+
+tasks which wait for loopback:
+  tid 21069 (tgid 21063) waits for tid 21068:
+	00007f65cdd1b10c __lll_lock_wait + 0x1c
+	00007f65cdd15885 pthread_mutex_lock + 0x75
+	00000000004009ca thread_start + 0x74
+	00007f65cdd13314 start_thread + 0xc4
+	00007f65cda513ed clone + 0x6d
+
+  tid 21068 (tgid 21063) waits for tid 21066:
+	00007f65cdd1b10c __lll_lock_wait + 0x1c
+	00007f65cdd15885 pthread_mutex_lock + 0x75
+	00000000004009ca thread_start + 0x74
+	00007f65cdd13314 start_thread + 0xc4
+	00007f65cda513ed clone + 0x6d
+
+  tid 21066 (tgid 21063) waits for tid 21065:
+	00007f65cdd1b10c __lll_lock_wait + 0x1c
+	00007f65cdd15885 pthread_mutex_lock + 0x75
+	00000000004009ca thread_start + 0x74
+	00007f65cdd13314 start_thread + 0xc4
+	00007f65cda513ed clone + 0x6d
+
+  tid 21067 (tgid 21063) waits for tid 21066:
+	00007f65cdd1b10c __lll_lock_wait + 0x1c
+	00007f65cdd15885 pthread_mutex_lock + 0x75
+	00000000004009ca thread_start + 0x74
+	00007f65cdd13314 start_thread + 0xc4
+	00007f65cda513ed clone + 0x6d
+
+Author:
+  Roman Pen <r.peniaev@gmail.com>, 2014

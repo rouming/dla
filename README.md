@@ -1,4 +1,0 @@
-dla
-===
-
-Futex deadlock analyser
