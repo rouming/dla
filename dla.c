@@ -442,9 +442,6 @@ static int nftw_proc_scan(const char *fpath, const struct stat *sb,
 
 		/* Update tgid, it can be changed since last scan */
 		task->tgid = tgid;
-		/* XXX CORRECT MEMSETTING SHOULD BE GUARANTEED BY THE ALGO ITSELF ON
-		*      EVERY SCAN */
-		/* task_init_pthread_info(task); */
 		assert(list_empty(&task->l_stuck));
 		task_init_syscall(task);
 	}
@@ -601,7 +598,6 @@ static int unwind_pthread_backtrace(struct task *t)
 	int status, ret;
 	int waits = 20;
 
-	/* XXX: on sudden death we have to do detach, TODO catch signals */
 	if (ptrace(PTRACE_ATTACH, t->tid, NULL, NULL) < 0) {
 		perror("ptrace(PTRACE_ATTACH)");
 		return -1;
@@ -667,183 +663,274 @@ static struct list_head *swap_scan_lists(struct list_head *lists,
 	return lists + ((pos + 1) % cnt);
 }
 
-int main(int argc, char *argv[])
-{
-	int ret;
-	unsigned int i;
+struct dla_params {
 	struct hash_table hash_tasks;
 	struct list_head  scan_lists[2];
 	struct list_head  stuck_list;
-	struct list_head *list = NULL;
+	struct list_head *list;
 	struct loopback   loops[16];
-	struct task *t_l, *tmp_l;
+};
+
+static int dla_scan(void *arg_)
+{
+	int ret;
+	unsigned int i;
+	struct dla_params *p = arg_;
+	struct task *t, *t_l, *tmp_l;
+	struct list_head *prev_list = p->list;
+	unsigned int      loop_nr = 0;
+
+	p->list = swap_scan_lists(p->scan_lists, ARRAY_SIZE(p->scan_lists),
+				  p->list);
+
+	/* Everything should be correctly cleaned up */
+	assert(list_empty(&p->stuck_list));
+
+	/* Scan all the tasks and fill the hash */
+	ret = do_tasks_scan(&p->hash_tasks, p->list, &p->stuck_list);
+	if (ret) {
+		printf("ERROR: do_tasks_scan failed, %d, repeat\n", ret);
+		goto free_dead;
+	}
+
+	/* We have some tasks stuck in futex, do further analysis */
+	while (!list_empty(&p->stuck_list)) {
+		struct task *t_prev = NULL;
+		struct loopback *loop;
+
+		t = list_first_entry(&p->stuck_list, struct task, l_stuck);
+		assert(!is_chain_loopback(t));
+
+		if (loop_nr >= ARRAY_SIZE(p->loops)) {
+			printf("WARNING: maximum number %d of possible loopbacks exceeded\n",
+			       loop_nr);
+			break;
+		}
+
+		loop = &p->loops[loop_nr];
+		assert(list_empty(&loop->loop_l));
+		assert(list_empty(&loop->spur_l));
+
+		/* Cycle till chain is broken or loopback is found */
+		do {
+			pid_t tid;
+
+			/* Move task to loop */
+			list_del(&t->l_stuck);
+			list_add_tail(&t->l_stuck, &loop->loop_l);
+			t->pthread_info.loop = loop;
+
+			ret = unwind_pthread_backtrace(t);
+			if (ret)
+				break;
+
+			/* Every task in chain should be suspicious */
+			if (list_empty(&t->l_stuck))
+				break;
+
+			/* Now we are interested only in pthread_mutex_lock */
+			if (!is_lll_lock_wait(&t->bt.frames[0]))
+				break;
+
+			/* Chain it */
+			if (t_prev)
+				t_prev->pthread_info.lock_owner_task = t;
+			t_prev = t;
+
+			/* Do hash lookup of lock owner */
+			tid = t->pthread_info.lock_owner_pid;
+			assert(tid != 0);
+			t = hash_lookup_entry(&p->hash_tasks, &tid, sizeof(tid),
+					      struct task, h_entry);
+
+		} while (t && !is_chain_loopback(t));
+
+		/* Handle two cases: chain is broken or chain is a spur
+		 * of another loop:
+		 *    chain is broken:      !t || !is_chain_loopback
+		 *    spur of another loop: t->loop != loop
+		 *
+		 * If chain is broken just forget about the tasks in this chain.
+		 * If chain is a spur and belongs to another loop just splice this
+		 * chain to the spur list of another loop.
+		 */
+		if (!t || !is_chain_loopback(t) ||
+		    t->pthread_info.loop != loop) {
+			int chain_broken = (!t || !is_chain_loopback(t));
+
+			list_for_each_entry_safe(t_l, tmp_l, &loop->loop_l,
+						 l_stuck) {
+				list_del(&t_l->l_stuck);
+				if (chain_broken) {
+					INIT_LIST_HEAD(&t_l->l_stuck);
+					task_init_pthread_info(t_l);
+				} else {
+					struct loopback *l;
+
+					assert(t);
+					l = t->pthread_info.loop;
+
+					t_l->pthread_info.loop = l;
+					list_add_tail(&t_l->l_stuck, &l->spur_l);
+				}
+			}
+			continue;
+		}
+
+		/* Got it, loopback is found, sort out spur tasks */
+		list_for_each_entry_safe(t_l, tmp_l, &loop->loop_l,
+					 l_stuck) {
+			/* Reach the loop entrance, quit */
+			if (t_l == t)
+				break;
+
+			list_del(&t_l->l_stuck);
+			list_add_tail(&t_l->l_stuck, &loop->spur_l);
+		}
+
+		loop_nr++;
+	}
+
+
+	/* There are no excuses to have non empty list with loops
+	 * less than possible, everything should be sorted out on
+	 * previous steps
+	 */
+	assert(list_empty(&p->stuck_list) || loop_nr >= ARRAY_SIZE(p->loops));
+
+	/* Here we have loopbacks and its' spurs, deal with them */
+	for (i = 0; i < loop_nr; i++) {
+		struct loopback *loop = &p->loops[i];
+
+		print_loopback(loop, i+1);
+
+		/* Return everything back to stuck list for
+		 * further cleanups
+		 */
+		list_splice(&loop->loop_l, &p->stuck_list);
+		list_splice(&loop->spur_l, &p->stuck_list);
+		loopback_init(loop);
+	}
+
+	/* Remove remains */
+	list_for_each_entry_safe(t_l, tmp_l, &p->stuck_list,
+				 l_stuck) {
+		list_del_init(&t_l->l_stuck);
+		task_init_pthread_info(t_l);
+	}
+
+free_dead:
+	/* Remove all tasks which now are dead since last scan */
+	if (prev_list) {
+		list_for_each_entry_safe(t_l, tmp_l, prev_list, l_entry)
+			hash_remove(&t_l->h_entry);
+	}
+
+	return 0;
+}
+
+static int dla_event_loop(unsigned int wakeup_sec,
+			  int (*event_fn)(void *arg), void *arg)
+{
+	sigset_t mask, old_mask;
+	int sfd;
+	fd_set rfds;
+	struct timeval tv;
+	int ret = -1;
+
+	sigemptyset(&mask);
+	sigaddset(&mask, SIGINT);
+	sigaddset(&mask, SIGTERM);
+	sigaddset(&mask, SIGQUIT);
+	sigaddset(&mask, SIGPIPE);
+
+	/* Block signals so that they aren't handled
+	 * according to their default dispositions */
+	if (sigprocmask(SIG_BLOCK, &mask, &old_mask) == -1) {
+		perror("sigprocmask()");
+		return -1;
+	}
+
+	sfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+	if (sfd == -1) {
+		perror("signalfd()");
+		ret = -1;
+		goto out;
+	}
+
+	while (1) {
+		int ret;
+
+		FD_ZERO(&rfds);
+		FD_SET(sfd, &rfds);
+
+		/* Wakeup timeout */
+		tv.tv_sec = wakeup_sec;
+		tv.tv_usec = 0;
+
+		ret = select(sfd + 1, &rfds, NULL, NULL, &tv);
+		if (ret == -1) {
+			perror("select()");
+			goto out;
+		}
+		else if (ret) {
+			struct signalfd_siginfo fdsi;
+
+			ret = read(sfd, &fdsi, sizeof(struct signalfd_siginfo));
+			if (ret != sizeof(fdsi)) {
+				perror("read(signalfd)");
+				ret = -errno;
+				goto out;
+			}
+
+			switch (fdsi.ssi_signo) {
+			case SIGPIPE:
+				break;
+			default:
+				printf("Terminating\n");
+				ret = -1;
+				goto out;
+			}
+		} else {
+			ret = event_fn(arg);
+			if (ret)
+				goto out;
+		}
+	}
+
+out:
+	/* Restore */
+	sigprocmask(SIG_SETMASK, &old_mask, NULL);
+
+	if (sfd != -1)
+		close(sfd);
+
+	return ret;
+}
+
+int main(int argc, char *argv[])
+{
+	int r;
+	unsigned i;
+	struct dla_params p;
 
 	(void)argc;
 	(void)argv;
 
-	INIT_LIST_HEAD(&scan_lists[0]);
-	INIT_LIST_HEAD(&scan_lists[1]);
-	INIT_LIST_HEAD(&stuck_list);
+	memset(&p, 0, sizeof(p));
+	INIT_LIST_HEAD(&p.scan_lists[0]);
+	INIT_LIST_HEAD(&p.scan_lists[1]);
+	INIT_LIST_HEAD(&p.stuck_list);
 
-	hash_init(&hash_tasks);
+	for (i = 0; i < ARRAY_SIZE(p.loops); i++)
+		loopback_init(&p.loops[i]);
 
-	for (i = 0; i < ARRAY_SIZE(loops); i++)
-		loopback_init(&loops[i]);
+	hash_init(&p.hash_tasks);
 
-	while (1) {
-		struct task *t,  *tmp;
-		struct list_head *prev_list = list;
-		unsigned int      loop_nr = 0;
+	/* Call dla main loop */
+	r = dla_event_loop(3, dla_scan, &p);
 
-		list = swap_scan_lists(scan_lists, ARRAY_SIZE(scan_lists), list);
+	hash_free(&p.hash_tasks);
 
-		/* Everything should be correctly cleaned up */
-		assert(list_empty(&stuck_list));
-
-		/* Scan all the tasks and fill the hash */
-		ret = do_tasks_scan(&hash_tasks, list, &stuck_list);
-		if (ret) {
-			printf("ERROR: do_tasks_scan failed, %d, repeat\n", ret);
-			goto free_dead;
-		}
-
-		/* We have some tasks stuck in futex, do further analysis */
-		while (!list_empty(&stuck_list)) {
-			struct task *t_prev = NULL;
-			struct loopback *loop;
-
-			t = list_first_entry(&stuck_list, struct task, l_stuck);
-			assert(!is_chain_loopback(t));
-
-			if (loop_nr >= ARRAY_SIZE(loops)) {
-				printf("WARNING: maximum number %d of possible loopbacks exceeded\n",
-				       loop_nr);
-				break;
-			}
-
-			loop = &loops[loop_nr];
-			assert(list_empty(&loop->loop_l));
-			assert(list_empty(&loop->spur_l));
-
-			/* Cycle till chain is broken or loopback is found */
-			do {
-				pid_t tid;
-
-				/* Move task to loop */
-				list_del(&t->l_stuck);
-				list_add_tail(&t->l_stuck, &loop->loop_l);
-				t->pthread_info.loop = loop;
-
-				ret = unwind_pthread_backtrace(t);
-				if (ret)
-					break;
-
-				/* Every task in chain should be suspicious */
-				if (list_empty(&t->l_stuck))
-					break;
-
-				/* Now we are interested only in pthread_mutex_lock */
-				if (!is_lll_lock_wait(&t->bt.frames[0]))
-					break;
-
-				/* Chain it */
-				if (t_prev)
-					t_prev->pthread_info.lock_owner_task = t;
-				t_prev = t;
-
-				/* Do hash lookup of lock owner */
-				tid = t->pthread_info.lock_owner_pid;
-				assert(tid != 0);
-				t = hash_lookup_entry(&hash_tasks, &tid, sizeof(tid),
-						      struct task, h_entry);
-
-			} while (t && !is_chain_loopback(t));
-
-			/* Handle two cases: chain is broken or chain is a spur
-			 * of another loop:
-			 *    chain is broken:      !t || !is_chain_loopback
-			 *    spur of another loop: t->loop != loop
-			 *
-			 * If chain is broken just forget about the tasks in this chain.
-			 * If chain is a spur and belongs to another loop just splice this
-			 * chain to the spur list of another loop.
-			 */
-			if (!t || !is_chain_loopback(t) ||
-			    t->pthread_info.loop != loop) {
-				int chain_broken = (!t || !is_chain_loopback(t));
-
-				list_for_each_entry_safe(t_l, tmp_l, &loop->loop_l,
-							 l_stuck) {
-					list_del(&t_l->l_stuck);
-					if (chain_broken) {
-						INIT_LIST_HEAD(&t_l->l_stuck);
-						task_init_pthread_info(t_l);
-					} else {
-						struct loopback *l;
-
-						assert(t);
-						l = t->pthread_info.loop;
-
-						t_l->pthread_info.loop = l;
-						list_add_tail(&t_l->l_stuck, &l->spur_l);
-					}
-				}
-				continue;
-			}
-
-			/* Got it, loopback is found, sort out spur tasks */
-			list_for_each_entry_safe(t_l, tmp_l, &loop->loop_l,
-						 l_stuck) {
-				/* Reach the loop entrance, quit */
-				if (t_l == t)
-					break;
-
-				list_del(&t_l->l_stuck);
-				list_add_tail(&t_l->l_stuck, &loop->spur_l);
-			}
-
-			loop_nr++;
-		}
-
-
-		/* There are no excuses to have non empty list with loops
-		 * less than possible, everything should be sorted out on
-		 * previous steps
-		 */
-		assert(list_empty(&stuck_list) || loop_nr >= ARRAY_SIZE(loops));
-
-		/* Here we have loopbacks and its' spurs, deal with them */
-		for (i = 0; i < loop_nr; i++) {
-			struct loopback *loop = &loops[i];
-
-			print_loopback(loop, i+1);
-
-			/* Return everything back to stuck list for
-			 * further cleanups
-			 */
-			list_splice(&loop->loop_l, &stuck_list);
-			list_splice(&loop->spur_l, &stuck_list);
-			loopback_init(loop);
-		}
-
-		/* Remove remains */
-		list_for_each_entry_safe(t_l, tmp_l, &stuck_list,
-					 l_stuck) {
-			list_del_init(&t_l->l_stuck);
-			task_init_pthread_info(t_l);
-		}
-
-	free_dead:
-		/* Remove all tasks which now are dead since last scan */
-		if (prev_list) {
-			list_for_each_entry_safe(t, tmp, prev_list, l_entry)
-				hash_remove(&t->h_entry);
-		}
-
-		sleep(3);
-	}
-
-	hash_free(&hash_tasks);
-
-	return 0;
+	return r;
 }
