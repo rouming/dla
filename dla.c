@@ -44,10 +44,17 @@
 #include <libunwind-ptrace.h>
 
 #include "list.h"
+#include "proto.h"
 
-#define MAX_HASHSIZE 1024
-
+#define MAX_HASHSIZE  1024
+#define DEFAULT_DELAY 5
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
+static char **arg_exe;
+static int    arg_exe_cnt;
 
 static unsigned int jhash(const void *key_, size_t len)
 {
@@ -593,41 +600,209 @@ static int peek_pthread_info(struct task *t)
 	return 0;
 }
 
-static void print_backtrace(struct task *t)
+static int output_stream_type(int fd, enum dla_stream_type t)
 {
-	unsigned int i;
-
-	printf("  tid %u (tgid %u) waits for tid %u:\n",
-	       t->tid, t->tgid, t->pthread_info.lock_owner_pid);
-
-	for (i = 0; i < t->bt.cnt; i++)
-		printf("\t%016lx %s + 0x%lx\n",
-		       (long)t->bt.frames[i].ip, t->bt.frames[i].f_name,
-		       (long)t->bt.frames[i].ip_off);
+	return dla_send_stream_type(fd, t);
 }
 
-static void print_loopback(struct loopback *l, unsigned int ind)
+static int output_stream_field(int fd, struct dla_stream_field *f)
+{
+	return dla_send_stream_field(fd, f);
+}
+
+static int output_task_fields(int fd, struct task *t)
+{
+	int r;
+	struct dla_stream_field field;
+	uint32_t val32;
+
+	r = output_stream_type(fd, TASK);
+	if (r)
+		return r;
+
+	/* tgid */
+	val32 = htole32((uint32_t)t->tid);
+	field.type = TASK_tgid;
+	field.len  = sizeof(val32);
+	memcpy(&field.data, &val32, field.len);
+
+	r = output_stream_field(fd, &field);
+	if (r)
+		return r;
+
+	/* tid */
+	val32 = htole32((uint32_t)t->tid);
+	field.type = TASK_tid;
+	field.len  = sizeof(val32);
+	memcpy(&field.data, &val32, field.len);
+
+	r = output_stream_field(fd, &field);
+	if (r)
+		return r;
+
+	/* dep tid */
+	val32 = htole32((uint32_t)t->pthread_info.lock_owner_pid);
+	field.type = TASK_dep_tid;
+	field.len  = sizeof(val32);
+	memcpy(&field.data, &val32, field.len);
+
+	r = output_stream_field(fd, &field);
+	if (r)
+		return r;
+
+	return 0;
+}
+
+static int output_frame_fields(int fd, struct backtrace_frame *f)
+{
+	int r;
+	struct dla_stream_field field;
+	uint64_t val64;
+	unsigned long valvar;
+
+	r = output_stream_type(fd, FRAME);
+	if (r)
+		return r;
+
+	/* addr */
+	val64 = htole64((uint64_t)f->ip);
+	valvar = (unsigned long)val64;
+	field.type = FRAME_addr;
+	field.len  = sizeof(valvar);
+	memcpy(&field.data, &valvar, field.len);
+
+	r = output_stream_field(fd, &field);
+	if (r)
+		return r;
+
+	/* off */
+	val64 = htole64((uint64_t)f->ip_off);
+	valvar = (unsigned long)val64;
+	field.type = FRAME_off;
+	field.len  = sizeof(valvar);
+	memcpy(&field.data, &valvar, field.len);
+
+	r = output_stream_field(fd, &field);
+	if (r)
+		return r;
+
+	/* func */
+	field.type = FRAME_func;
+	field.len  = MIN(sizeof(field.data), strlen(f->f_name));
+	memcpy(&field.data, f->f_name, field.len);
+
+	r = output_stream_field(fd, &field);
+	if (r)
+		return r;
+
+
+	return 0;
+}
+
+static int output_backtrace(int fd, struct task *t)
+{
+	int r;
+	unsigned int i;
+
+	r = output_task_fields(fd, t);
+	if (r)
+		return r;
+	for (i = 0; i < t->bt.cnt; i++) {
+		r = output_frame_fields(fd, &t->bt.frames[i]);
+		if (r)
+			return r;
+	}
+
+	return 0;
+}
+
+static int run_filter_app(pid_t *chpid)
+{
+	int r;
+	pid_t ch;
+	int pipefd[] = { [0] = -1, [1] = -1 };
+
+	r = pipe(pipefd);
+	if (r != 0) {
+		perror("pipe2()");
+		return -1;
+	}
+
+	ch = fork();
+	if (ch < 0) {
+		perror("fork()");
+		goto out;
+	}
+	else if (!ch) {
+		int fd;
+		close(pipefd[1]);
+		fd = dup2(pipefd[0], 0);
+		if (fd < 0) {
+			close(pipefd[0]);
+			perror("dup2()");
+			exit(1);
+		}
+		r = execv(arg_exe[0], arg_exe);
+		perror("exec()");
+		exit(1);
+	}
+
+	r = 0;
+	*chpid = ch;
+
+out:
+	close(pipefd[0]);
+	if (r) {
+		close(pipefd[1]);
+		return -1;
+	}
+
+	return pipefd[1];
+}
+
+static int output_loopback(struct loopback *l)
 {
 	struct task *t;
+	int fd, r, status;
+	pid_t chpid;
 
-	printf("----------------------------------------------\n");
-	printf("%u) lock loopback:\n", ind);
+	fd = run_filter_app(&chpid);
+	if (fd < 0) {
+		printf("ERROR: can't execute filter app, %d\n", fd);
+		return -1;
+	}
 
+	r = output_stream_type(fd, DEADLOCK);
+	if (r)
+		goto err;
 	list_for_each_entry(t, &l->loop_l, l_stuck) {
-		print_backtrace(t);
-		printf("\n");
+		r = output_backtrace(fd, t);
+		if (r)
+			goto err;
 	}
 
 	if (!list_empty(&l->spur_l)) {
-		printf("tasks which wait for loopback:\n");
-
+		r = output_stream_type(fd, DEPS);
+		if (r)
+			goto err;
 		list_for_each_entry(t, &l->spur_l, l_stuck) {
-			print_backtrace(t);
-			printf("\n");
+			r = output_backtrace(fd, t);
+			if (r)
+				goto err;
 		}
-
-		printf("\n");
 	}
+
+	r = output_stream_type(fd, END);
+	if (r)
+		goto err;
+
+	r = 0;
+
+err:
+	close(fd);
+	waitpid(chpid, &status, 0);
+
+	return r;
 }
 
 static int unwind_pthread_backtrace(struct task *t)
@@ -855,7 +1030,7 @@ static int dla_scan(void *arg_)
 	for (i = 0; i < loop_nr; i++) {
 		struct loopback *loop = &p->loops[i];
 
-		print_loopback(loop, i+1);
+		output_loopback(loop);
 
 		/* Return everything back to stuck list for
 		 * further cleanups
@@ -964,14 +1139,78 @@ out:
 	return ret;
 }
 
-int main(int argc, char *argv[])
+static void usage(void)
 {
-	int r;
-	unsigned i;
+	printf("Deadlock analyser tool.\n\n"
+	       "dla [--help] [--delay N] [-D] --exe prog [arguments]\n\n"
+	       "  -e|--exe app [args]   Filter application which will be executed on every found deadlock problem.\n"
+	       "                            e.g.:\n"
+	       "                           --exe ./filter-deadlock\n"
+	       "                        Pass arguments after the program name to the program when it is run.\n"
+	       "  -d|--delay            The delay in seconds between processes scan, default is 5 seconds.\n"
+	       "  -D|--daemon           Run as daemon.\n"
+	       "  -h|--help             Show usage information.\n"
+	);
+}
+
+struct option opts[] = {
+	{ "exe",    required_argument, NULL, 'e' },
+	{ "delay",  required_argument, NULL, 'd' },
+	{ "daemon", no_argument,       NULL, 'D' },
+	{ "help",   no_argument,       NULL, 'h' },
+	{ NULL, 0, NULL, 0 }
+};
+const char *opts_str = "e:d:Dh";
+
+int main(int argc, char **argv)
+{
+	int c, r;
+	unsigned i, delay = DEFAULT_DELAY, daemonize = 0;
 	struct dla_params p;
 
-	(void)argc;
-	(void)argv;
+	while ((c = getopt_long(argc, argv, opts_str,
+				opts, NULL)) != -1) {
+		switch (c) {
+		case 'e':
+			arg_exe     = argv + optind - 1;
+			arg_exe_cnt = argc - optind + 1;
+			break;
+		case 'd':
+			if (1 != sscanf(optarg, "%u", &delay)) {
+				usage();
+				return 1;
+			}
+			break;
+		case 'D':
+			daemonize = 1;
+			break;
+		case 'h':
+		default:
+			usage();
+			return 0;
+		}
+	}
+
+	if (!arg_exe) {
+		printf("ERROR: Filter application was not specified, see --exe option\n\n");
+		usage();
+		return 1;
+	}
+	if (access(arg_exe[0], R_OK | X_OK)) {
+		perror("ERROR: access(exe, R_OK | X_OK)");
+		fprintf(stderr, "\n");
+		usage();
+		return 1;
+	}
+	if (!delay) {
+		printf("ERROR: Delay is wrong: %u\n\n", delay);
+		usage();
+		return 1;
+	}
+
+	/* Run as deamon */
+	if (daemonize)
+		daemon(0, 0);
 
 	memset(&p, 0, sizeof(p));
 	INIT_LIST_HEAD(&p.scan_lists[0]);
@@ -985,7 +1224,7 @@ int main(int argc, char *argv[])
 	hash_init(&p.hash_tasks);
 
 	/* Call dla main loop */
-	r = dla_event_loop(3, dla_scan, &p);
+	r = dla_event_loop(delay, dla_scan, &p);
 
 	hash_free(&p.hash_tasks);
 
