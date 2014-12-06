@@ -43,15 +43,13 @@
 
 #include <libunwind-ptrace.h>
 
-struct UPT_info;
-
 #include "list.h"
 
 #define MAX_HASHSIZE 1024
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-unsigned int jhash(const void *key_, size_t len)
+static unsigned int jhash(const void *key_, size_t len)
 {
 	unsigned int hash, i;
 	const unsigned char *key = key_;
@@ -96,6 +94,12 @@ struct loopback {
 	struct list_head spur_l;
 };
 
+enum task_state {
+	TASK_NEWBIE     = 0,
+	TASK_TO_ANALYSE = 1,
+	/* >1 - task stuck */
+};
+
 struct task {
 	struct hash_entry h_entry;
 	struct list_head  l_entry;
@@ -104,8 +108,16 @@ struct task {
 	pid_t tgid;
 	pid_t tid;
 
-	unsigned long      diff_vol_ctxt_sw;
-	unsigned long      diff_nonvol_ctxt_sw;
+	/* If true derefer analysis on next scan */
+	unsigned int       need_relax;
+
+	/*  0 - newbie, task was just created, TASK_NEWBIE
+	 *  1 - task can be analysed, TASK_TO_ANALYSE
+	 * >1 - has been detected as stuck */
+	unsigned int       stuck_generation;
+
+	unsigned int       diff_vol_ctxt_sw;
+	unsigned int       diff_nonvol_ctxt_sw;
 
 	unsigned long long start_ms;
 	unsigned long long check_ms;
@@ -134,7 +146,7 @@ static void loopback_init(struct loopback *l)
 	INIT_LIST_HEAD(&l->spur_l);
 }
 
-static int is_chain_loopback(struct task *t)
+static int is_task_in_loop(struct task *t)
 {
 	return !!(t->pthread_info.lock_owner_task);
 }
@@ -257,6 +269,16 @@ static void task_init_syscall(struct task *t)
 static void task_init_pthread_info(struct task *t)
 {
 	memset(&t->pthread_info, 0, sizeof(t->pthread_info));
+}
+
+static int is_task_newbie(const struct task *task)
+{
+	return (task->stuck_generation == TASK_NEWBIE);
+}
+
+static int was_task_stuck(struct task *task)
+{
+	return (task->stuck_generation > TASK_TO_ANALYSE);
 }
 
 static int is_task_stuck(const struct task *task)
@@ -400,7 +422,8 @@ static int task_get_start_ms(pid_t tid, unsigned long long *start_ms)
 struct {
 	struct hash_table *tasks;
 	struct list_head  *list;
-	struct list_head  *stuck_list;
+	struct list_head  *old_stuck_list;
+	struct list_head  *new_stuck_list;
 } __nftw_ctx;
 
 static int nftw_proc_scan(const char *fpath, const struct stat *sb,
@@ -444,6 +467,8 @@ static int nftw_proc_scan(const char *fpath, const struct stat *sb,
 		task->tgid = tgid;
 		assert(list_empty(&task->l_stuck));
 		task_init_syscall(task);
+		if (is_task_newbie(task))
+			task->stuck_generation = TASK_TO_ANALYSE;
 	}
 
 	list_add_tail(&task->l_entry, __nftw_ctx.list);
@@ -451,20 +476,33 @@ static int nftw_proc_scan(const char *fpath, const struct stat *sb,
 	task->check_ms = msecs_epoch();
 	task_fill_ctxt_sw(task);
 
-	if (is_task_stuck(task) && task_fill_syscall(task))
-		if (is_task_stuck_in_futex(task))
-			list_add(&task->l_stuck, __nftw_ctx.stuck_list);
+	if (!is_task_newbie(task) && !task->need_relax) {
+		if (is_task_stuck(task) &&
+			task_fill_syscall(task) &&
+			is_task_stuck_in_futex(task)) {
+			if (was_task_stuck(task))
+				list_add(&task->l_stuck, __nftw_ctx.old_stuck_list);
+			else
+				list_add(&task->l_stuck, __nftw_ctx.new_stuck_list);
+			task->stuck_generation++;
+		} else
+			task->stuck_generation = TASK_TO_ANALYSE;
+	}
+
+	task->need_relax = 0;
 
 	return 0;
 }
 
 static int do_tasks_scan(struct hash_table *hash_tasks, struct list_head *list,
-			 struct list_head *stuck_list)
+			 struct list_head *old_stuck_list,
+			 struct list_head *new_stuck_list)
 {
 	/* What we can do? Nothing, just do not use threads */
-	__nftw_ctx.tasks      = hash_tasks;
-	__nftw_ctx.list       = list;
-	__nftw_ctx.stuck_list = stuck_list;
+	__nftw_ctx.tasks          = hash_tasks;
+	__nftw_ctx.list           = list;
+	__nftw_ctx.old_stuck_list = old_stuck_list;
+	__nftw_ctx.new_stuck_list = new_stuck_list;
 
 	if (nftw("/proc", nftw_proc_scan, 32, FTW_PHYS) == -1) {
 		perror("nftw");
@@ -473,6 +511,8 @@ static int do_tasks_scan(struct hash_table *hash_tasks, struct list_head *list,
 
 	return 0;
 }
+
+struct UPT_info;
 
 static int do_backtrace(struct backtrace_frame *bt, unsigned int *bt_sz,
 			unsigned int max_bt_sz, unw_addr_space_t as,
@@ -603,6 +643,11 @@ static int unwind_pthread_backtrace(struct task *t)
 		return -1;
 	}
 
+	/* Ptrace impacts on task switch counters, thus we have
+	 * to skip one scan to be sure all the counters are again
+	 * stable */
+	t->need_relax = 1;
+
 	/* Wait for ptrace stop */
 	do {
 		ret = wait4(t->tid, &status,
@@ -666,7 +711,8 @@ static struct list_head *swap_scan_lists(struct list_head *lists,
 struct dla_params {
 	struct hash_table hash_tasks;
 	struct list_head  scan_lists[2];
-	struct list_head  stuck_list;
+	struct list_head  old_stuck_list;
+	struct list_head  new_stuck_list;
 	struct list_head *list;
 	struct loopback   loops[16];
 };
@@ -677,35 +723,37 @@ static int dla_scan(void *arg_)
 	unsigned int i;
 	struct dla_params *p = arg_;
 	struct task *t, *t_l, *tmp_l;
-	struct list_head *prev_list = p->list;
+	struct list_head *dead_list = p->list;
 	unsigned int      loop_nr = 0;
 
 	p->list = swap_scan_lists(p->scan_lists, ARRAY_SIZE(p->scan_lists),
 				  p->list);
 
 	/* Everything should be correctly cleaned up */
-	assert(list_empty(&p->stuck_list));
+	assert(list_empty(&p->old_stuck_list));
+	assert(list_empty(&p->new_stuck_list));
 
 	/* Scan all the tasks and fill the hash */
-	ret = do_tasks_scan(&p->hash_tasks, p->list, &p->stuck_list);
+	ret = do_tasks_scan(&p->hash_tasks, p->list, &p->old_stuck_list,
+			    &p->new_stuck_list);
 	if (ret) {
 		printf("ERROR: do_tasks_scan failed, %d, repeat\n", ret);
 		goto free_dead;
 	}
 
 	/* We have some tasks stuck in futex, do further analysis */
-	while (!list_empty(&p->stuck_list)) {
+	while (!list_empty(&p->new_stuck_list)) {
 		struct task *t_prev = NULL;
 		struct loopback *loop;
-
-		t = list_first_entry(&p->stuck_list, struct task, l_stuck);
-		assert(!is_chain_loopback(t));
 
 		if (loop_nr >= ARRAY_SIZE(p->loops)) {
 			printf("WARNING: maximum number %d of possible loopbacks exceeded\n",
 			       loop_nr);
 			break;
 		}
+
+		t = list_first_entry(&p->new_stuck_list, struct task, l_stuck);
+		assert(!is_task_in_loop(t));
 
 		loop = &p->loops[loop_nr];
 		assert(list_empty(&loop->loop_l));
@@ -743,20 +791,20 @@ static int dla_scan(void *arg_)
 			t = hash_lookup_entry(&p->hash_tasks, &tid, sizeof(tid),
 					      struct task, h_entry);
 
-		} while (t && !is_chain_loopback(t));
+		} while (t && !is_task_in_loop(t));
 
 		/* Handle two cases: chain is broken or chain is a spur
 		 * of another loop:
-		 *    chain is broken:      !t || !is_chain_loopback
+		 *    chain is broken:      !t || !is_task_in_loop
 		 *    spur of another loop: t->loop != loop
 		 *
 		 * If chain is broken just forget about the tasks in this chain.
 		 * If chain is a spur and belongs to another loop just splice this
 		 * chain to the spur list of another loop.
 		 */
-		if (!t || !is_chain_loopback(t) ||
+		if (!t || !is_task_in_loop(t) ||
 		    t->pthread_info.loop != loop) {
-			int chain_broken = (!t || !is_chain_loopback(t));
+			int chain_broken = (!t || !is_task_in_loop(t));
 
 			list_for_each_entry_safe(t_l, tmp_l, &loop->loop_l,
 						 l_stuck) {
@@ -764,6 +812,8 @@ static int dla_scan(void *arg_)
 				if (chain_broken) {
 					INIT_LIST_HEAD(&t_l->l_stuck);
 					task_init_pthread_info(t_l);
+					/* The whole chain should be analysed again */
+					t_l->stuck_generation = TASK_TO_ANALYSE;
 				} else {
 					struct loopback *l;
 
@@ -796,7 +846,7 @@ static int dla_scan(void *arg_)
 	 * less than possible, everything should be sorted out on
 	 * previous steps
 	 */
-	assert(list_empty(&p->stuck_list) || loop_nr >= ARRAY_SIZE(p->loops));
+	assert(list_empty(&p->new_stuck_list) || loop_nr >= ARRAY_SIZE(p->loops));
 
 	/* Here we have loopbacks and its' spurs, deal with them */
 	for (i = 0; i < loop_nr; i++) {
@@ -807,13 +857,16 @@ static int dla_scan(void *arg_)
 		/* Return everything back to stuck list for
 		 * further cleanups
 		 */
-		list_splice(&loop->loop_l, &p->stuck_list);
-		list_splice(&loop->spur_l, &p->stuck_list);
+		list_splice(&loop->loop_l, &p->old_stuck_list);
+		list_splice(&loop->spur_l, &p->old_stuck_list);
 		loopback_init(loop);
 	}
 
+	/* Move newly stuck tasks to old list */
+	list_splice(&p->new_stuck_list, &p->old_stuck_list);
+
 	/* Remove remains */
-	list_for_each_entry_safe(t_l, tmp_l, &p->stuck_list,
+	list_for_each_entry_safe(t_l, tmp_l, &p->old_stuck_list,
 				 l_stuck) {
 		list_del_init(&t_l->l_stuck);
 		task_init_pthread_info(t_l);
@@ -821,8 +874,8 @@ static int dla_scan(void *arg_)
 
 free_dead:
 	/* Remove all tasks which now are dead since last scan */
-	if (prev_list) {
-		list_for_each_entry_safe(t_l, tmp_l, prev_list, l_entry)
+	if (dead_list) {
+		list_for_each_entry_safe(t_l, tmp_l, dead_list, l_entry)
 			hash_remove(&t_l->h_entry);
 	}
 
@@ -920,7 +973,8 @@ int main(int argc, char *argv[])
 	memset(&p, 0, sizeof(p));
 	INIT_LIST_HEAD(&p.scan_lists[0]);
 	INIT_LIST_HEAD(&p.scan_lists[1]);
-	INIT_LIST_HEAD(&p.stuck_list);
+	INIT_LIST_HEAD(&p.old_stuck_list);
+	INIT_LIST_HEAD(&p.new_stuck_list);
 
 	for (i = 0; i < ARRAY_SIZE(p.loops); i++)
 		loopback_init(&p.loops[i]);
