@@ -13,10 +13,6 @@ LFLAGS = -L$(LIBUNWIND_LIBPATH) $(LIBUNWIND_LIBS) -lpthread -lrt
 
 TOOLS  = dla filter-deadlock test-deadlock
 
-SRCS = $(wildcard *.c)
-DEPS = $(SRCS:.c=.d)
--include $(DEPS)
-
 all: $(TOOLS)
 
 dla: dla.o proto.o
@@ -30,3 +26,7 @@ filter-deadlock: filter-deadlock.o
 
 clean:
 	$(RM) $(TOOLS) *~ *.o *.d
+
+SRCS = $(wildcard *.c)
+DEPS = $(SRCS:.c=.d)
+-include $(DEPS)
