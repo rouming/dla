@@ -621,7 +621,7 @@ static int output_task_fields(int fd, struct task *t)
 		return r;
 
 	/* tgid */
-	val32 = htole32((uint32_t)t->tid);
+	val32 = htole32((uint32_t)t->tgid);
 	field.type = TASK_tgid;
 	field.len  = sizeof(val32);
 	memcpy(&field.data, &val32, field.len);
