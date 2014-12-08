@@ -761,18 +761,22 @@ static int dla_scan(void *arg_)
 		/* Cycle till chain is broken or loopback is found */
 		do {
 			pid_t tid;
+			int is_suspicious;
+
+			is_suspicious = !list_empty(&t->l_stuck);
 
 			/* Move task to loop */
 			list_del(&t->l_stuck);
 			list_add_tail(&t->l_stuck, &loop->loop_l);
 			t->pthread_info.loop = loop;
 
-			ret = unwind_pthread_backtrace(t);
-			if (ret)
+			/* Every task in chain should be suspicious */
+			if (!is_suspicious)
 				break;
 
-			/* Every task in chain should be suspicious */
-			if (list_empty(&t->l_stuck))
+			/* Unwind backtrace */
+			ret = unwind_pthread_backtrace(t);
+			if (ret)
 				break;
 
 			/* Now we are interested only in pthread_mutex_lock */
