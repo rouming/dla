@@ -319,11 +319,10 @@ static void hash_free(struct hash_table *h)
 	unsigned int i;
 
 	for (i = 0; i < h->h_sz; i++) {
-		struct hash_entry *e;
+		struct hash_entry *e, *tmp;
 		struct list_head *head = &h->h_tbl[i];
-		list_for_each_entry(e, head, h_list) {
+		list_for_each_entry_safe(e, tmp, head, h_list)
 			e->h_free(e);
-		}
 	}
 }
 
