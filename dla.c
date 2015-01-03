@@ -940,6 +940,13 @@ static int dla_scan(void *arg_)
 
 			is_suspicious = !list_empty(&t->l_stuck);
 
+			/* Loop consists of 1 element, i.e. thread was self-deadlocked.
+			 * Avoid further checks and jump to chaining */
+			if (t_prev == t) {
+				assert(is_suspicious);
+				goto chain_it;
+			}
+
 			/* Move task to loop */
 			list_del(&t->l_stuck);
 			list_add_tail(&t->l_stuck, &loop->loop_l);
@@ -958,6 +965,7 @@ static int dla_scan(void *arg_)
 			if (!is_lll_lock_wait(&t->bt.frames[0]))
 				break;
 
+		chain_it:
 			/* Chain it */
 			if (t_prev)
 				t_prev->pthread_info.lock_owner_task = t;
