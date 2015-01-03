@@ -115,9 +115,6 @@ struct task {
 	pid_t tgid;
 	pid_t tid;
 
-	/* If true derefer analysis on next scan */
-	unsigned int       need_relax;
-
 	/*  0 - newbie, task was just created, TASK_NEWBIE
 	 *  1 - task can be analysed, TASK_TO_ANALYSE
 	 * >1 - has been detected as stuck */
@@ -482,7 +479,7 @@ static int nftw_proc_scan(const char *fpath, const struct stat *sb,
 	task->check_ms = msecs_epoch();
 	task_fill_ctxt_sw(task);
 
-	if (!is_task_newbie(task) && !task->need_relax) {
+	if (!is_task_newbie(task)) {
 		if (is_task_stuck(task) &&
 			task_fill_syscall(task) &&
 			is_task_stuck_in_futex(task)) {
@@ -494,8 +491,6 @@ static int nftw_proc_scan(const char *fpath, const struct stat *sb,
 		} else
 			task->stuck_generation = TASK_TO_ANALYSE;
 	}
-
-	task->need_relax = 0;
 
 	return 0;
 }
@@ -817,11 +812,6 @@ static int unwind_pthread_backtrace(struct task *t)
 		return -1;
 	}
 
-	/* Ptrace impacts on task switch counters, thus we have
-	 * to skip one scan to be sure all the counters are again
-	 * stable */
-	t->need_relax = 1;
-
 	/* Wait for ptrace stop */
 	do {
 		ret = wait4(t->tid, &status,
@@ -866,6 +856,15 @@ err_free_addr_space:
 	unw_destroy_addr_space(as);
 err_detach:
 	ptrace(PTRACE_DETACH, t->tid, NULL, NULL);
+
+	/* Ptrace impacts on task switch counters, thus we have
+	 * to wait when task returns to stuck state */
+	do {
+		task_fill_ctxt_sw(t);
+		task_fill_syscall(t);
+
+	} while (!is_task_stuck(t) ||
+		 !is_task_stuck_in_futex(t));
 
 	return ret;
 }
