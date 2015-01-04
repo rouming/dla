@@ -61,10 +61,27 @@ $(LIBUNWIND)/src/.libs/libunwind-arm.a: $(LIBUNWIND)/Makefile
 $(LIBUNWIND)/src/.libs/libunwind-ptrace.a: $(LIBUNWIND)/Makefile
 	$(MAKE) -C $(LIBUNWIND)
 
+rpm:
+	mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+	rm -rf ~/rpmbuild/SOURCES/dla.tar.gz
+	cp -r . ~/rpmbuild/SOURCES/dla
+
+	(cd ~/rpmbuild/SOURCES/dla; rm -rf .git; make clean)
+	(cd ~/rpmbuild/SOURCES/; tar -czf ./dla.tar.gz ./dla; rm -rf ./dla)
+
+	rpmbuild --clean --target=$(MACHINE) -ba ./packaging/dla.spec
+	rm -f ~/rpmbuild/SOURCES/dla.tar.gz
+
+install:
+	for tool in $(TOOLS); do \
+		mkdir -p $(DESTDIR)/usr/bin; \
+		install -m 0755 $$tool $(DESTDIR)/usr/bin/$$tool; \
+    done
+
 clean:
 	$(RM) -r $(TOOLS) *~ *.o *.d $(LIBUNWIND)
 
-.PHONY: clean all
+.PHONY: clean all install rpm
 
 SRCS = $(wildcard *.c)
 DEPS = $(SRCS:.c=.d)
