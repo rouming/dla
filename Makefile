@@ -23,11 +23,6 @@ LIBUNWIND_LIBS = $(LIBUNWIND_PTRACE_LIB) $(LIBUNWIND_ARCH_LIB) $(LIBUNWIND_MAIN_
 CFLAGS = -std=gnu99 -MD -g -Wall -Werror -Wextra $(DEFINES) -I$(LIBUNWIND_INC)
 LFLAGS = -lpthread -lrt
 
-# x86-64
-ifneq (, $(findstring x86, $(MACHINE)))
-	LFLAGS += -llzma
-endif
-
 TOOLS  = dla filter-deadlock test-deadlock
 
 all:
@@ -51,7 +46,10 @@ $(LIBUNWIND)/configure.ac:
 $(LIBUNWIND)/configure: $(LIBUNWIND)/configure.ac
 	autoreconf -i $(LIBUNWIND)
 $(LIBUNWIND)/Makefile: $(LIBUNWIND)/configure
-	(cd $(LIBUNWIND); ./configure --disable-shared --target=$(MACHINE) --host=$(MACHINE))
+	(cd $(LIBUNWIND); ./configure --disable-shared \
+								  --disable-minidebuginfo \
+								  --target=$(MACHINE) \
+								  --host=$(MACHINE))
 $(LIBUNWIND)/src/.libs/libunwind.a: $(LIBUNWIND)/Makefile
 	$(MAKE) -C $(LIBUNWIND)
 $(LIBUNWIND)/src/.libs/libunwind-x86_64.a: $(LIBUNWIND)/Makefile
