@@ -73,8 +73,12 @@ rpm:
 	 tar -czf ./dla-$(VERSION).tar.gz ./dla-$(VERSION); \
 	 rm -rf ./dla-$(VERSION))
 
+# Here in --target we have to add '-linux' as suffix, because
+# rpmbuild generates OS and ARCH tags looking into the target
+# string (rpmrc.c: rpmRebuildTargetVars), and OS should be the
+# last.
 	rpmbuild --clean \
-			 --target=$(MACHINE) \
+			 --target=$(MACHINE)-linux \
 			 --define "_version $(VERSION)" \
 			 -ba ./packaging/dla.spec
 	rm -f ~/rpmbuild/SOURCES/dla-$(VERSION).tar.gz
