@@ -1,9 +1,9 @@
 Summary:            Futex dead-lock analyser
 Name:               dla
-Version:            0.1
+Version:            %{_version}
 Release:            1
 License:            GPLv2+
-Source:             dla.tar.gz
+Source:             dla-%{_version}.tar.gz
 
 %description
 Analyses simple ABBA deadlocks (basically pthread_mutex_lock) from user
@@ -15,7 +15,7 @@ something on your system has stuck and you have to understand what exactly
 and to see the locking dependency.
 
 %prep
-%autosetup -n %{name}
+%setup -q
 
 %build
 make %{?_smp_mflags}
@@ -23,7 +23,7 @@ make %{?_smp_mflags}
 %install
 %make_install
 
-install -m 755 -d %{buildroot}/%{_bindir}
+install -m 755 -d %{buildroot}%{_bindir}
 
 %files
 %doc README

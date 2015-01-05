@@ -1,5 +1,7 @@
 # Makefile for dla tool
 
+VERSION=0.1
+
 CC = $(CROSS_COMPILE)gcc
 MACHINE = $(shell $(CC) -dumpmachine)
 
@@ -61,14 +63,21 @@ $(LIBUNWIND)/src/.libs/libunwind-ptrace.a: $(LIBUNWIND)/Makefile
 
 rpm:
 	mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
-	rm -rf ~/rpmbuild/SOURCES/dla.tar.gz
-	cp -r . ~/rpmbuild/SOURCES/dla
+	rm -rf ~/rpmbuild/SOURCES/dla-$(VERSION).tar.gz
+	cp -r . ~/rpmbuild/SOURCES/dla-$(VERSION)
 
-	(cd ~/rpmbuild/SOURCES/dla; rm -rf .git; make clean)
-	(cd ~/rpmbuild/SOURCES/; tar -czf ./dla.tar.gz ./dla; rm -rf ./dla)
+	(cd ~/rpmbuild/SOURCES/dla-$(VERSION); \
+	 rm -rf .git; \
+	 make clean)
+	(cd ~/rpmbuild/SOURCES/; \
+	 tar -czf ./dla-$(VERSION).tar.gz ./dla-$(VERSION); \
+	 rm -rf ./dla-$(VERSION))
 
-	rpmbuild --clean --target=$(MACHINE) -ba ./packaging/dla.spec
-	rm -f ~/rpmbuild/SOURCES/dla.tar.gz
+	rpmbuild --clean \
+			 --target=$(MACHINE) \
+			 --define "_version $(VERSION)" \
+			 -ba ./packaging/dla.spec
+	rm -f ~/rpmbuild/SOURCES/dla-$(VERSION).tar.gz
 
 install:
 	for tool in $(TOOLS); do \
