@@ -28,5 +28,5 @@ install -m 755 -d %{buildroot}%{_bindir}
 %files
 %doc README
 %{_bindir}/dla
-%{_bindir}/test-deadlock
-%{_bindir}/filter-deadlock
+%{_bindir}/dla-test-deadlock
+%{_bindir}/dla-filter-deadlock

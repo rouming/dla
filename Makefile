@@ -25,7 +25,7 @@ LIBUNWIND_LIBS = $(LIBUNWIND_PTRACE_LIB) $(LIBUNWIND_ARCH_LIB) $(LIBUNWIND_MAIN_
 CFLAGS = -std=gnu99 -MD -g -Wall -Werror -Wextra $(DEFINES) -I$(LIBUNWIND_INC)
 LFLAGS = -lpthread -lrt
 
-TOOLS  = dla filter-deadlock test-deadlock
+TOOLS  = dla dla-filter-deadlock dla-test-deadlock
 
 all:
 	$(MAKE) libunwind
@@ -37,10 +37,10 @@ build: $(TOOLS)
 dla: dla.o proto.o $(LIBUNWIND_LIBS)
 	$(CC) -o $@ $^ $(LFLAGS)
 
-test-deadlock: test-deadlock.o
+dla-test-deadlock: test-deadlock.o
 	$(CC) -o $@ $^ $(LFLAGS)
 
-filter-deadlock: filter-deadlock.o
+dla-filter-deadlock: filter-deadlock.o
 	$(CC) -o $@ $^
 
 $(LIBUNWIND)/configure.ac:
@@ -68,7 +68,7 @@ rpm:
 
 	(cd ~/rpmbuild/SOURCES/dla-$(VERSION); \
 	 rm -rf .git; \
-	 make clean)
+	 make distclean)
 	(cd ~/rpmbuild/SOURCES/; \
 	 tar -czf ./dla-$(VERSION).tar.gz ./dla-$(VERSION); \
 	 rm -rf ./dla-$(VERSION))
@@ -90,7 +90,10 @@ install:
     done
 
 clean:
-	$(RM) -r $(TOOLS) *~ *.o *.d $(LIBUNWIND)
+	$(RM) -r $(TOOLS) *~ *.o *.d
+
+distclean: clean
+	$(RM) -r $(LIBUNWIND)
 
 .PHONY: clean all install rpm
 
